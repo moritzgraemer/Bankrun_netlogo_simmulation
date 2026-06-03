@@ -9,6 +9,7 @@
 - **connectivity**: Links to other node
 	- `stubbornness` Wahrscheinlichkeit den eigenen State zu behalten trotz Umfeld (Heterogenität!)
 - **insider** /**outsider** Typ
+- **wealth** wie viel in Bank gelagert, kann % oder total sein
 
 ## Instanz der Bank
 - `health` für die Gesundheit der Bankenbilanz (stetige Funktion)
