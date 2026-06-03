@@ -29,5 +29,8 @@
 - check if the bank is abankrupt
 - klick on nodes to spread akute panic
 
+## Mögliche Erweiterung
+- mehrere Banken, nur eine schlecht, trotzdem spread auf andere durch social media ??
+
 
 🐈‍⬛
