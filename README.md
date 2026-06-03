@@ -32,6 +32,7 @@
 ## Mögliche Erweiterung
 - mehrere Banken, nur eine schlecht, trotzdem spread auf andere durch social media ??
 - können auch noch Speed of communication einführen: Kommunikation über social media schneller als über normale...hier Frage ob das nicht schon durch connectivity gegeben?
+- unterschiedliche wealth Verteilung (siehe Santos und Nakane)
 
 
 🐈‍⬛
