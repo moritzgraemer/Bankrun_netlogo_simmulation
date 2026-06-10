@@ -25,7 +25,7 @@
 	- bank sends rumor depending on the health function to insiders.
 - observe neighbors
 - adjust state_of_mind
-	-  `rewiring-probability` – Watts-Strogatz-Parameter: zwischen reinem Gitter (Dorf) und random (Internet) (randmly reconnect to other nodes)
+	-  `rewiring-probability` – Watts-Strogatz-Parameter (Parameter, der angibt wie stark die Nodes in Gruppen verbunden sind): zwischen reinem Gitter (Dorf) und random (Internet) (randmly reconnect to other nodes) (Beachten, das die Länge der Verbindungen egal ist. jede Verbindung hat das Gewicht 1)
 - check if the bank is abankrupt
 - klick on nodes to spread akute panic
 
