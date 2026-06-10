@@ -8,7 +8,7 @@ credibility (how much influenence does one neighbor hold, (credibility score nee
 link-strength – starke Links (Familie) vs. schwache Links (Twitter-Follow); Granovetter
 connectivity: Links to other node
 stubbornness Wahrscheinlichkeit den eigenen State zu behalten trotz Umfeld (Heterogenität!)
-insider** /**outsider** bool
+insider** /**outsider** type
 Schwellvariable S, wann state switch
 
 bank init 
