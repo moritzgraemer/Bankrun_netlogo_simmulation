@@ -1,0 +1,30 @@
+
+Eigenschaften Agents[
+  state_of_minde => calm = blau, concerned = orange, withdraw = rot
+  forgetfullness => ]0,1] jede Runde zufälliger Zug ob state zurückwechseln, withdrawn => concerned und concerned => calm 
+  naivety => ]0,1] was muss Durchschnittliches Signal Nachbarn sein, damit state wechseln, Grenze für concerned < Grenze für withdraw 
+  conncetions => wie viele Nachbarn
+  credibility => wie sehr glauben mir andere und gewichten danach ihre Entscheidung state wechseln [0,1], Radius Node gibt an wie credible
+  Insider => Boolean(Insider = 1, Outsider = 0)
+]
+
+init[
+  create Nodes mit den Eigenschaften, ziehe da wo werte aus Intervalle Random alle var werden einmal fesrgelegt
+  create die Verbindungen zwischen den verschieden Nodes, dabei gibt es Schieberegler, welcher die Connctivity angibt, es sollen nicht alle Agenten selbe anzahl an connectivtiy haben (möglicher weise Watts-Strogatz)
+]
+
+go[
+  spread Rumor
+  change state
+]
+
+spread Rumor[
+  für alle Insider = 1, ziehe mit Random W'keit ob ein Rumor gepsreaded wird, wenn ja, dann ändere State zu withdraw
+]
+
+change state[
+  ask turtle nutzen, da nacheinander zufällig
+  schau Nachbarn, folgende Funktion: jeder Nachbar sendet Signal = [calm = 0, concerned = 0.5, withdraw = 1], multiplizires jedes Signal mit der credibility des senders, teile durch Anzahl der Nachbarn 
+  wenn diese Funktion die Naivety überschreitet, jeweils wechsel zu calm oder withdraw
+  wenn nicht change geändert: shcau ob zurückändert mit prob forgetfullnes
+]
