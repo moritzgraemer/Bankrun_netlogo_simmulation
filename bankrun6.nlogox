@@ -1,0 +1,1601 @@
+<?xml version='1.0' encoding='utf-8'?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code>;; ============================================================================
+;; BANKRUN ABM - Liquiditaetsmodell mit Ansteckung vs. Heilung
+;; ============================================================================
+;;
+;; &gt;&gt;&gt; DIESE WIDGETS IM INTERFACE-TAB ANLEGEN, SONST LAEUFT DAS MODELL NICHT &lt;&lt;&lt;
+;;
+;; BUTTONS (Observer):
+;;   setup    -&gt; setup        (forever = AUS / once)
+;;   go       -&gt; go           (forever = AN)
+;;   shock    -&gt; shock        (forever = AUS / once)   ;; Run ausloesen: nach setup klicken
+;;
+;; SLIDER (Name / min / max / step / default):
+;;   ;; --- Netzwerk / Ansteckung ---
+;;   num-nodes              10   500   1     200    ;; Anzahl Einleger-Knoten
+;;   avg-connections         2    20   1       6    ;; mittlerer Grad (Watts-Strogatz)
+;;   beta                    0     1   0.01    0.2   ;; WS-Rewiring (0=Ring, 1=random)
+;;   watcher-share           0     1   0.01    0.15  ;; Anteil Watcher (sehen s(l) direkt)
+;;   watcher-credibility    0.5    1   0.01    0.9   ;; Glaubwuerdigkeit der Watcher (Einfluss)
+;;   risk-threshold         0.05   1   0.01    0.4   ;; Schwelle z. Zustandswechsel; HOCH = stabiler
+;;   shock-size              0     1   0.01    0.3   ;; Staerke des Ausloesers
+;;   spontaneous-concern     0   0.05  0.001   0.005 ;; normaler Liquiditaetsbedarf (Rauschboden)
+;;   ;; --- Bank / Heilung ---
+;;   reserve-ratio          0.01  0.5  0.01    0.1   ;; Reservequote r (exogen, Puffer) -- HEATMAP-ACHSE
+;;   lolr-cap                0    0.1  0.005   0.02  ;; max. Zentralbank-Kredit pro Tick (Anteil Start-Deposits)
+;;   forgetfulness           0    0.5  0.01    0.05  ;; Heilungsrate (Stimmung zurueck + Wiedereinzahlung)
+;;
+;; SWITCHES (On/Off):
+;;   lolr-active?                   On    ;; Lender-of-Last-Resort an/aus
+;;   fundamental-shock?             Off   ;; Off = Perception-Schock (Panik), On = echter Liquiditaetsschock
+;;   weight-by-credibility-sum?     Off   ;; Off = avg /n , On = avg /Sum(credibility) (Watcher dominieren)
+;;
+;; MONITORS (optional, aber empfohlen):
+;;   frac-withdrawn     signal     liquidity-ratio     bank-alive?
+;;
+;; PLOT (optional): "States" mit 3 Pens, Update-Command je Pen:
+;;   plot frac-calm   |   plot frac-concerned   |   plot frac-withdrawn
+;; PLOT (optional): "Bank" mit 2 Pens:
+;;   plot liquidity-ratio   |   plot signal
+;; ============================================================================
+;; NEUE WIDGETS FUER DIVERSITAET &amp; GESCHWINDIGKEIT
+;; ============================================================================
+;;
+;; PLOT "Diversity" (normaler zeitbasierter Plot, X-Achse = ticks):
+;;   Pen "avg-entropy"   Update Command: plot avg-opinion-entropy
+;;   Y min 0 / Y max 1.585 (= log2(3), theoretisches Maximum)
+;;   -&gt; Miss dies NUR im ungeschockten Ruhezustand fuer saubere
+;;      avg-connections/beta-Vergleiche (siehe Diskussion: waehrend einer
+;;      Kaskade ist der Wert eine Transiente, kein struktureller Fakt)
+;;
+;; PLOT "Cascade Speed" (X-Achse = ticks-since-shock, NICHT ticks!
+;;   Deshalb 'plotxy' statt 'plot' verwenden -- 'plot' wuerde die eigene,
+;;   automatisch hochzaehlende Tick-Achse nutzen, nicht ticks-since-shock):
+;;   Pen "concerned"   Update Command: if ticks-since-shock &gt;= 0
+;;                                       [ plotxy ticks-since-shock frac-concerned ]
+;;   Pen "withdraw"    Update Command: if ticks-since-shock &gt;= 0
+;;                                       [ plotxy ticks-since-shock frac-withdrawn ]
+;;   X min 0 / X max z.B. 500 (anpassen je nach beobachteter Kaskadendauer)
+;;   Y min 0 / Y max 1
+;;   -&gt; Die STEIGUNG dieser Kurven direkt nach t=0 ist dein Geschwindigkeitsmass;
+;;      steilere Anstiege = schnellere Ansteckung fuer die jeweilige Parameterwahl
+;;
+;; MONITOR (optional, zur Kontrolle waehrend Testlaeufen):
+;;   avg-opinion-entropy    ticks-since-shock
+;; ============================================================================
+;; ============================================================================
+
+
+globals [
+  current-signal     ;; s(l) im aktuellen Tick, [0,1]
+  bank-liquidity     ;; l : liquide Mittel der Bank
+  bank-deposits      ;; d : Gesamteinlagen in der Bank
+  initial-deposits   ;; Referenzwert fuer lolr-cap
+  bank-debt          ;; aufgenommener Zentralbank-Kredit
+  bank-alive?        ;; absorbierender Todeszustand
+  shocked?           ;; NEU: false bis shock-Button gedrueckt wird; sperrt baseline-noise vorher
+  ;; dynamic-rewiring?  ;; On: Agenten knuepfen bei Eskalation neue Kontakte
+  shock-tick        ;; NEU: Tick des ERSTEN Schocks, -1 = noch kein Schock erfolgt
+  peak-withdrawn    ;; NEU: Maximum von frac-withdrawn ueber den gesamten Lauf
+]
+
+turtles-own [
+  state              ;; "calm" | "concerned" | "withdraw"
+  deposit-i          ;; Einlage dieses Agenten in der Bank
+  cash-held          ;; abgehobenes Geld, das der Agent bei sich haelt
+  credibility        ;; [0,1] -&gt; Knotengroesse / Einfluss
+  watcher?           ;; true = empfaengt s(l) direkt
+  naivety-concerned  ;; untere Schwelle (calm -&gt; concerned)
+  naivety-withdraw   ;; obere Schwelle (concerned -&gt; withdraw)
+]
+
+
+;;;;;;;;;;;;;;;;;;;;;;;
+;;;     SETUP      ;;;;
+;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup
+  clear-all
+  set-default-shape turtles "circle"
+
+  ;; --- Agenten erzeugen, RANDOM ueber die Karte verteilt ---
+  create-turtles num-nodes [
+    setxy random-xcor random-ycor
+    set state "calm"
+    set deposit-i 0.5 + random-float 1.5          ;; Wealth-Heterogenitaet
+    set cash-held 0
+    set watcher? (random-float 1 &lt; watcher-share)
+    ifelse watcher?
+      [ set credibility watcher-credibility + random-float (1 - watcher-credibility)
+        set shape "target" ]                      
+      [ set credibility random-float 0.5
+        set shape "circle" ]  
+    ;; heterogene Schwellen, skaliert mit risk-threshold; concerned &lt; withdraw
+    set naivety-concerned risk-threshold * (0.5 + random-float 0.5)
+    set naivety-withdraw  naivety-concerned + (1 - naivety-concerned) * (0.2 + random-float 0.6)
+    set size 0.5 + credibility
+  ]
+
+  build-network
+
+  ;; --- Bankbilanz initialisieren: l = r * d, Signal = 0 ---
+  set bank-deposits   sum [deposit-i] of turtles
+  set initial-deposits bank-deposits
+  set bank-liquidity  reserve-ratio * bank-deposits
+  set bank-debt       0
+  set current-signal  0
+  set bank-alive?     true
+  set shocked?        false  ;; NEU: System startet im stabilen Zustand
+  set shock-tick  -1
+  set peak-withdrawn  0      ;; NEU: Peak-Tracking zuruecksetzen
+
+  recolor
+  reset-ticks
+end
+
+;; Ring-Gitter ueber den INDEX (who) + WS-Rewiring.
+;; Die Position auf der Karte ist random -&gt; rein visuell; die Topologie bleibt Watts-Strogatz.
+to build-network
+  let half floor (avg-connections / 2)
+  ask turtles [
+    let id who
+    let i 1
+    while [i &lt;= half] [
+      create-link-with turtle ((id + i) mod num-nodes)
+      set i i + 1
+    ]
+  ]
+  ;; zufaelliges Rewiring mit Wahrscheinlichkeit beta
+  ask links [
+    if random-float 1 &lt; beta [
+      let keep-end one-of both-ends
+      let candidates turtles with [self != keep-end and not link-neighbor? keep-end]
+      if any? candidates [
+        ask keep-end [ create-link-with one-of candidates ]
+        die
+      ]
+    ]
+  ]
+  ask links [ set color gray ]
+  ;; Federlayout zur besseren Visualisierung
+  repeat 100 [
+    layout-spring turtles links 0.2 8 2
+    display
+  ]
+  ;; Knoten Richtung Mitte skalieren
+
+  ask turtles [
+
+    setxy (xcor * 0.8) (ycor * 0.8)
+
+  ]
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;
+;;;      GO       ;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Tick-Reihenfolge: Signal -&gt; normaler Bedarf -&gt; Agenten entscheiden
+;;                   -&gt; Bank managt Liquiditaet (LoLR / Tod / Rueckzahlung)
+to go
+  if not bank-alive? [ stop ]
+  update-signal
+  baseline-noise
+  agents-decide
+  bank-manage-liquidity
+  recolor
+  tick
+end
+
+;; ============================================================================
+;; GO FUER BEHAVIORSPACE (unbeaufsichtigt, deterministischer Schock bei t=0)
+;; Interface-`go` bleibt unangetastet; Experimente nutzen `go-exp`.
+;; Der Schock feuert automatisch beim Tick `warmup-ticks` -&gt; flache Baseline t&lt;0,
+;; danach zaehlt `ticks-since-shock` sauber ab 0.
+;; ============================================================================
+to go-exp
+  if not bank-alive? [ stop ]
+  if ticks = warmup-ticks [ shock ]        ;; deterministischer t=0-Schock
+  update-signal
+  baseline-noise
+  agents-decide
+  bank-manage-liquidity
+  if frac-withdrawn &gt; peak-withdrawn [ set peak-withdrawn frac-withdrawn ]  ;; Peak-Tracking
+  recolor
+  tick
+end
+
+;; ============================================================================
+;; GO FUER DIE EVENT-STUDY (Experiment 2, runMetricsEveryStep=true)
+;; WICHTIG: hier KEIN "stop" bei Tod. Die tote Bank wird eingefroren und der
+;; Lauf tickt bis zum Fensterende weiter (In-Model-Carry-Forward), damit
+;; ticks-since-shock die Exit-Bedingung (&gt;= 200) sicher erreicht und jeder Lauf
+;; gleich lange Zeitreihen liefert. Wuerde man go-exp nutzen, blieben tote
+;; Laeufe stehen -&gt; BehaviorSpace haengt.
+;; ============================================================================
+to go-event
+  if ticks = warmup-ticks [ shock ]        ;; deterministischer t=0-Schock
+  if bank-alive? [
+    update-signal
+    baseline-noise
+    agents-decide
+    bank-manage-liquidity
+    if frac-withdrawn &gt; peak-withdrawn [ set peak-withdrawn frac-withdrawn ]
+    recolor
+  ]
+  ;; Bank tot -&gt; Zustand eingefroren, Metriken tragen den Terminalwert weiter
+  tick
+end
+
+;; s(l) = (r - l/d) / r , gekappt auf [0,1]
+to update-signal
+  ifelse bank-deposits &gt; 0
+    [ set current-signal (reserve-ratio - (bank-liquidity / bank-deposits)) / reserve-ratio ]
+    [ set current-signal 1 ]
+  set current-signal max (list 0 (min (list 1 current-signal)))
+end
+
+;; normaler Liquiditaetsbedarf: kleine Chance, dass ruhige Agenten besorgt werden (Rauschboden)
+;; NEU: laeuft nur nach dem Schock (shocked? = true), davor bleibt das System eingefroren
+to baseline-noise
+  ;; if not shocked? [ stop ]  ;; deaktiviert: Rauschen laeuft auch vor dem Schock (bewusste Entscheidung)
+  ask turtles with [state = "calm"] [
+    if random-float 1 &lt; spontaneous-concern [ set-state "concerned" ]
+  ]
+end
+
+;; Eskalation ueber Schwellen, De-Eskalation NUR stochastisch (Hysterese).
+;; Alle Agenten sehen dasselbe Signal vom Tick-Anfang.
+;; Eskalation ueber Schwellen (Vorrang), De-Eskalation stochastisch UND UNABHAENGIG vom Signal.
+;; NEU: forgetfulness wirkt jetzt auch, wenn perceived noch hoch ist ("echte" Vergesslichkeit,
+;;      nicht mehr an perceived &lt; naivety-concerned gekoppelt).
+to agents-decide
+  ask turtles [
+    let perceived perceived-signal
+    let escalated? false
+
+    ifelse perceived &gt;= naivety-withdraw [
+      if state != "withdraw" [
+        become-withdraw
+        seek-connection
+        set escalated? true
+      ]
+    ] [
+      if perceived &gt;= naivety-concerned [
+        if state = "calm" [
+          set-state "concerned"
+          seek-connection
+          set escalated? true
+        ]
+      ]
+    ]
+
+    ;; Vergesslichkeit: unabhaengig von perceived, aber nur wenn in diesem Tick
+    ;; keine Eskalation stattgefunden hat (Eskalation hat Vorrang).
+    if not escalated? [
+      if random-float 1 &lt; forgetfulness [ step-down ]
+    ]
+  ]
+end
+
+
+to seek-connection
+  if not dynamic-rewiring? [ stop ]
+  if random-float 1 &lt; beta [
+    let candidates other turtles with [not link-neighbor? myself]
+    if any? candidates [
+      create-link-with one-of candidates [ set color yellow ]
+    ]
+  ]
+end
+
+;; wahrgenommenes Signal: sozialer Nachbar-Durchschnitt;
+;; Watcher hoeren zusaetzlich die Bank (= extra hoch-glaubwuerdiger "Nachbar" mit s(l))
+to-report perceived-signal
+  let total 0
+  let wsum 0
+  let cnt 0
+  ask link-neighbors [
+    set total total + (signal-of state) * credibility
+    set wsum wsum + credibility
+    set cnt cnt + 1
+  ]
+  if watcher? [
+    set total total + current-signal * credibility
+    set wsum wsum + credibility
+    set cnt cnt + 1
+  ]
+  if cnt = 0 [ report 0 ]
+  ifelse weight-by-credibility-sum?
+    [ ifelse wsum &gt; 0 [ report total / wsum ] [ report 0 ] ]
+    [ report total / cnt ]
+end
+
+to-report signal-of [s]
+  if s = "calm"      [ report 0 ]
+  if s = "concerned" [ report 0.5 ]
+  report 1   ;; "withdraw"
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;
+;;;  GELDFLUESSE   ;;;;
+;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Abheben: Einlage wandert in cash-held, Bank zahlt aus
+to become-withdraw
+  set cash-held      cash-held + deposit-i
+  set bank-liquidity bank-liquidity - deposit-i
+  set bank-deposits  bank-deposits - deposit-i
+  set deposit-i      0
+  set-state "withdraw"
+end
+
+;; Wiedereinzahlung (beim Beruhigen): Geld zurueck zur Bank
+to redeposit
+  set bank-liquidity bank-liquidity + cash-held
+  set bank-deposits  bank-deposits + cash-held
+  set deposit-i      cash-held
+  set cash-held      0
+end
+
+;; einen Zustand zurueck; beim Verlassen von "withdraw" wird wieder eingezahlt
+to step-down
+  ifelse state = "withdraw"
+    [ redeposit  set-state "concerned" ]
+    [ if state = "concerned" [ set-state "calm" ] ]
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;
+;;;     BANK      ;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;
+
+;; LoLR fuellt l bis zum Ziel r*d auf (begrenzt pro Tick); Tod bei l&lt;0;
+;; Zwei-Wege-Ventil: Ueberschuss zahlt Kredit zurueck
+to bank-manage-liquidity
+  let target reserve-ratio * bank-deposits
+
+  if lolr-active? and bank-liquidity &lt; target [
+    let need   target - bank-liquidity
+    let cap    lolr-cap * initial-deposits
+    let borrow min (list need cap)
+    set bank-liquidity bank-liquidity + borrow
+    set bank-debt      bank-debt + borrow
+  ]
+
+  ;; Abhebungen konnten nicht gedeckt werden -&gt; Bank stirbt (absorbierend)
+  if bank-liquidity &lt; 0 [ set bank-alive? false ]
+
+  ;; l ueber Ziel -&gt; Geld zurueck an Zentralbank
+  if bank-liquidity &gt; target [
+    let excess bank-liquidity - target
+    let repay  min (list excess bank-debt)
+    set bank-liquidity bank-liquidity - repay
+    set bank-debt      bank-debt - repay
+  ]
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;
+;;;   AUSLOESER   ;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Run ausloesen (Button "shock"). Toggle fundamental-shock? entscheidet den Typ:
+;;   Off (perception): Geruecht trifft einige Watcher -&gt; Panik, Fundamental intakt
+;;   On  (fundamental): echter Liquiditaetsverlust -&gt; s(l) steigt real
+to shock
+  if shock-tick = -1 [ set shock-tick ticks ]   ;; NEU: fixiert t=0 fuer die Geschwindigkeitsmessung
+  set shocked? true
+  ifelse fundamental-shock? [
+    set bank-liquidity bank-liquidity - shock-size * reserve-ratio * bank-deposits
+  ] [
+    let n-shock round (shock-size * count turtles with [watcher?])
+    if n-shock &gt; 0 [
+      ask n-of n-shock turtles with [watcher?] [ become-withdraw ]
+    ]
+  ]
+  recolor
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;
+;;;  DARSTELLUNG  ;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;
+
+to set-state [s]
+  set state s
+end
+
+to recolor
+  ask turtles [
+    if state = "calm"      [ set color blue ]
+    if state = "concerned" [ set color orange ]
+    if state = "withdraw"  [ set color red ]
+  ]
+end
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;
+;;;   REPORTER    ;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;
+
+to-report frac-calm      report count turtles with [state = "calm"]      / count turtles end
+to-report frac-concerned report count turtles with [state = "concerned"] / count turtles end
+to-report frac-withdrawn report count turtles with [state = "withdraw"]  / count turtles end
+to-report signal         report current-signal end
+to-report liquidity-ratio
+  ifelse bank-deposits &gt; 0 [ report bank-liquidity / bank-deposits ] [ report 0 ]
+end
+
+to-report avg-opinion-entropy
+  let connected turtles with [count link-neighbors &gt; 0]
+  ifelse any? connected
+    [ report mean [opinion-entropy] of connected ]
+    [ report 0 ]
+end
+
+;; ---- GESCHWINDIGKEIT ----
+;; Ticks seit dem ERSTEN Schock; -1 solange noch kein Schock ausgeloest wurde.
+;; Als X-Achse fuer den Kaskaden-Plot nutzen, NICHT den rohen ticks-Zaehler,
+;; damit Laeufe mit unterschiedlichem Schock-Zeitpunkt vergleichbar bleiben.
+to-report ticks-since-shock
+  ifelse shock-tick = -1 [ report -1 ] [ report ticks - shock-tick ]
+end
+  
+;; ---- DIVERSITAET ----
+;; Shannon-Entropie ueber die Zustandsverteilung der eigenen Nachbarn.
+;; 0 = alle Nachbarn im selben Zustand (homogen/keine Diversitaet)
+;; log2(3) ~ 1.585 = maximal divers (Nachbarn gleichmaessig auf calm/concerned/withdraw verteilt)
+to-report opinion-entropy
+  let n count link-neighbors
+  if n = 0 [ report 0 ]
+  let counts (list
+    count link-neighbors with [state = "calm"]
+    count link-neighbors with [state = "concerned"]
+    count link-neighbors with [state = "withdraw"])
+  let h 0
+  foreach counts [ c -&gt;
+    if c &gt; 0 [
+      let p c / n
+      set h h - (p * ln p / ln 2)
+    ]
+  ]
+  report h
+end
+</code>
+  <widgets>
+    <view x="835" wrappingAllowedX="false" y="0" frameRate="30.0" minPycor="-16" height="584" showTickCounter="true" patchSize="17.6" fontSize="10" wrappingAllowedY="false" width="584" tickCounterLabel="Zeittakte" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16" />
+    <button x="25" actionKey="S" y="15" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="61">setup</button>
+    <monitor x="360" precision="17" y="70" height="60" fontSize="11" width="100">bank-alive?</monitor>
+    <monitor x="360" precision="17" y="130" height="60" fontSize="11" width="100">liquidity-ratio</monitor>
+    <monitor x="460" precision="17" y="70" height="60" fontSize="11" width="100">frac-withdrawn</monitor>
+    <monitor x="460" precision="3" y="130" height="60" fontSize="11" width="100" display="signal /health">1 - signal</monitor>
+    <plot x="590" autoPlotX="true" yMax="1.0" autoPlotY="true" y="195" xMin="0.0" height="225" legend="true" xMax="10.0" yMin="0.0" width="230" display="Bank">
+      <setup />
+      <update />
+      <pen interval="1.0" mode="0" display="liquidity/illiquid ratio" color="-11085214" legend="true">
+        <setup />
+        <update>plot liquidity-ratio</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="signal" color="-2139308" legend="true">
+        <setup />
+        <update>plot signal</update>
+      </pen>
+    </plot>
+    <plot x="360" autoPlotX="true" yMax="1.0" autoPlotY="false" yAxis="%" y="195" xMin="0.0" height="250" legend="true" xMax="10.0" yMin="0.0" width="230" display="States">
+      <setup />
+      <update />
+      <pen interval="1.0" mode="0" display="frac calm" color="-13345367" legend="true">
+        <setup />
+        <update>plot frac-calm</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="frac concerned" color="-955883" legend="true">
+        <setup />
+        <update>plot frac-concerned</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="frac withdraw" color="-2674135" legend="true">
+        <setup />
+        <update>plot frac-withdrawn</update>
+      </pen>
+    </plot>
+    <slider x="25" step="0.01" y="320" max="1" width="250" display="risk-threshold" height="50" min="0.05" direction="Horizontal" default="0.82" variable="risk-threshold" />
+    <slider x="25" step="0.01" y="370" max="0.5" width="250" display="forgetfulness" height="50" min="0" direction="Horizontal" default="0.22" variable="forgetfulness" />
+    <slider x="25" step="0.001" y="420" max="0.5" width="250" display="spontaneous-concern" height="50" min="0" direction="Horizontal" default="0.016" variable="spontaneous-concern" />
+    <slider x="25" step="0.01" y="470" max="1" width="250" display="reserve-ratio" height="50" min="0.01" direction="Horizontal" default="0.01" variable="reserve-ratio" />
+    <slider x="25" step="0.005" y="520" max="0.1" width="250" display="lolr-cap" height="50" min="0" direction="Horizontal" default="0.001" variable="lolr-cap" />
+    <switch x="605" y="550" height="40" on="true" variable="fundamental-shock?" width="165" display="fundamental-shock?" />
+    <switch x="605" y="590" height="40" on="true" variable="weight-by-credibility-sum?" width="185" display="weight-by-credibility-sum?" />
+    <switch x="605" y="510" height="40" on="false" variable="dynamic-rewiring?" width="145" display="dynamic-rewiring?" />
+    <switch x="605" y="470" height="40" on="true" variable="lolr-active?" width="100" display="lolr-active?" />
+    <slider x="25" step="0.01" y="570" max="1" width="250" display="shock-size" height="50" min="0" direction="Horizontal" default="0.34" variable="shock-size" />
+    <slider x="25" step="1" y="625" max="200" width="250" display="warmup-ticks" height="50" min="0" direction="Horizontal" default="25.0" variable="warmup-ticks" />
+    <monitor x="360" precision="17" y="560" height="60" fontSize="11" width="100">frac-withdrawn</monitor>
+    <monitor x="360" precision="17" y="505" height="60" fontSize="11" width="100">frac-concerned</monitor>
+    <monitor x="360" precision="17" y="445" height="60" fontSize="11" width="112">frac-calm</monitor>
+    <button x="95" actionKey="G" y="15" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="65">go
+</button>
+    <button x="170" actionKey="X" y="15" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="61">shock</button>
+    <slider x="25" step="1" y="70" max="500" width="250" display="num-nodes" height="50" min="10" direction="Horizontal" default="200.0" variable="num-nodes" />
+    <slider x="25" step="1" y="120" max="20" width="250" display="avg-connections" height="50" min="2" direction="Horizontal" default="13.0" variable="avg-connections" />
+    <slider x="25" step="0.01" y="170" max="1" width="250" display="beta" height="50" min="0" direction="Horizontal" default="0.14" variable="beta" />
+    <slider x="25" step="0.01" y="270" max="1" width="250" display="watcher-credibility" height="50" min="0.5" direction="Horizontal" default="0.7" variable="watcher-credibility" />
+    <slider x="25" step="0.01" y="220" max="1" width="250" display="watcher-share" height="50" min="0" direction="Horizontal" default="0.05" variable="watcher-share" />
+    <plot x="520" autoPlotX="true" yMax="1.585" autoPlotY="true" y="690" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" display="Diversity">
+      <setup />
+      <update />
+      <pen interval="1.0" mode="0" display="avg-entropy" color="-16777216" legend="true">
+        <setup />
+        <update>plot avg-opinion-entropy</update>
+      </pen>
+    </plot>
+    <plot x="785" autoPlotX="true" yMax="1.0" autoPlotY="true" y="690" xMin="0.0" height="175" legend="false" xMax="1.0" yMin="0.0" width="230" display="Cascade Speed">
+      <setup />
+      <update />
+      <pen interval="1.0" mode="0" display="concerned" color="-955883" legend="true">
+        <setup />
+        <update>if ticks-since-shock &gt;= 0 [ plotxy ticks-since-shock frac-concerned ]</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="withdraw" color="-2674135" legend="true">
+        <setup />
+        <update>if ticks-since-shock &gt;= 0 [ plotxy ticks-since-shock frac-withdrawn ]</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5" />
+        <point x="40" y="250" />
+        <point x="150" y="205" />
+        <point x="260" y="250" />
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0" />
+        <point x="135" y="15" />
+        <point x="120" y="60" />
+        <point x="120" y="105" />
+        <point x="15" y="165" />
+        <point x="15" y="195" />
+        <point x="120" y="180" />
+        <point x="135" y="240" />
+        <point x="105" y="270" />
+        <point x="120" y="285" />
+        <point x="150" y="270" />
+        <point x="180" y="285" />
+        <point x="210" y="270" />
+        <point x="165" y="240" />
+        <point x="180" y="180" />
+        <point x="285" y="195" />
+        <point x="285" y="165" />
+        <point x="180" y="105" />
+        <point x="180" y="60" />
+        <point x="165" y="15" />
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0" />
+        <point x="0" y="150" />
+        <point x="105" y="150" />
+        <point x="105" y="293" />
+        <point x="195" y="293" />
+        <point x="195" y="150" />
+        <point x="300" y="150" />
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285" />
+        <point x="285" y="225" />
+        <point x="285" y="75" />
+        <point x="150" y="135" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135" />
+        <point x="15" y="75" />
+        <point x="150" y="15" />
+        <point x="285" y="75" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75" />
+        <point x="15" y="225" />
+        <point x="150" y="285" />
+        <point x="150" y="135" />
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150" />
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150" />
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150" />
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true" />
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true" />
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true" />
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150" />
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150" />
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165" />
+        <point x="209" y="199" />
+        <point x="225" y="225" />
+        <point x="225" y="255" />
+        <point x="195" y="270" />
+        <point x="165" y="255" />
+        <point x="150" y="240" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165" />
+        <point x="89" y="198" />
+        <point x="75" y="225" />
+        <point x="75" y="255" />
+        <point x="105" y="270" />
+        <point x="135" y="255" />
+        <point x="150" y="240" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148" />
+        <point x="100" y="105" />
+        <point x="55" y="90" />
+        <point x="25" y="90" />
+        <point x="10" y="105" />
+        <point x="10" y="135" />
+        <point x="25" y="180" />
+        <point x="40" y="195" />
+        <point x="85" y="194" />
+        <point x="139" y="163" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150" />
+        <point x="200" y="105" />
+        <point x="245" y="90" />
+        <point x="275" y="90" />
+        <point x="290" y="105" />
+        <point x="290" y="135" />
+        <point x="275" y="180" />
+        <point x="260" y="195" />
+        <point x="215" y="195" />
+        <point x="162" y="165" />
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255" />
+        <point x="135" y="225" />
+        <point x="120" y="150" />
+        <point x="135" y="120" />
+        <point x="150" y="105" />
+        <point x="165" y="120" />
+        <point x="180" y="150" />
+        <point x="165" y="225" />
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true" />
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150" />
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150" />
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180" />
+        <point x="279" y="164" />
+        <point x="261" y="144" />
+        <point x="240" y="135" />
+        <point x="226" y="132" />
+        <point x="213" y="106" />
+        <point x="203" y="84" />
+        <point x="185" y="63" />
+        <point x="159" y="50" />
+        <point x="135" y="50" />
+        <point x="75" y="60" />
+        <point x="0" y="150" />
+        <point x="0" y="165" />
+        <point x="0" y="225" />
+        <point x="300" y="225" />
+        <point x="300" y="180" />
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true" />
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true" />
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80" />
+        <point x="132" y="78" />
+        <point x="134" y="135" />
+        <point x="209" y="135" />
+        <point x="194" y="105" />
+        <point x="189" y="96" />
+        <point x="180" y="89" />
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true" />
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true" />
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true" />
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true" />
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true" />
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193" />
+        <point x="197" y="249" />
+        <point x="179" y="249" />
+        <point x="177" y="196" />
+        <point x="166" y="187" />
+        <point x="140" y="189" />
+        <point x="93" y="191" />
+        <point x="78" y="179" />
+        <point x="72" y="211" />
+        <point x="49" y="209" />
+        <point x="48" y="181" />
+        <point x="37" y="149" />
+        <point x="25" y="120" />
+        <point x="25" y="89" />
+        <point x="45" y="72" />
+        <point x="103" y="84" />
+        <point x="179" y="75" />
+        <point x="198" y="76" />
+        <point x="252" y="64" />
+        <point x="272" y="81" />
+        <point x="293" y="103" />
+        <point x="285" y="121" />
+        <point x="255" y="121" />
+        <point x="242" y="118" />
+        <point x="224" y="167" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210" />
+        <point x="86" y="251" />
+        <point x="62" y="249" />
+        <point x="48" y="208" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114" />
+        <point x="16" y="195" />
+        <point x="9" y="204" />
+        <point x="23" y="213" />
+        <point x="25" y="200" />
+        <point x="39" y="123" />
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true" />
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true" />
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true" />
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255" />
+        <point x="90" y="239" />
+        <point x="62" y="213" />
+        <point x="47" y="191" />
+        <point x="67" y="179" />
+        <point x="90" y="203" />
+        <point x="109" y="218" />
+        <point x="150" y="225" />
+        <point x="192" y="218" />
+        <point x="210" y="203" />
+        <point x="227" y="181" />
+        <point x="251" y="194" />
+        <point x="236" y="217" />
+        <point x="212" y="240" />
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true" />
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true" />
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true" />
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168" />
+        <point x="90" y="184" />
+        <point x="62" y="210" />
+        <point x="47" y="232" />
+        <point x="67" y="244" />
+        <point x="90" y="220" />
+        <point x="109" y="205" />
+        <point x="150" y="198" />
+        <point x="192" y="205" />
+        <point x="210" y="220" />
+        <point x="227" y="242" />
+        <point x="251" y="229" />
+        <point x="236" y="206" />
+        <point x="212" y="183" />
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131" />
+        <point x="21" y="87" />
+        <point x="15" y="86" />
+        <point x="0" y="120" />
+        <point x="15" y="150" />
+        <point x="0" y="180" />
+        <point x="13" y="214" />
+        <point x="20" y="212" />
+        <point x="45" y="166" />
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195" />
+        <point x="119" y="235" />
+        <point x="95" y="218" />
+        <point x="76" y="210" />
+        <point x="46" y="204" />
+        <point x="60" y="165" />
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45" />
+        <point x="83" y="77" />
+        <point x="71" y="103" />
+        <point x="86" y="114" />
+        <point x="166" y="78" />
+        <point x="135" y="60" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136" />
+        <point x="151" y="77" />
+        <point x="226" y="81" />
+        <point x="280" y="119" />
+        <point x="292" y="146" />
+        <point x="292" y="160" />
+        <point x="287" y="170" />
+        <point x="270" y="195" />
+        <point x="195" y="210" />
+        <point x="151" y="212" />
+        <point x="30" y="166" />
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true" />
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150" />
+        <point x="270" y="90" />
+        <point x="90" y="30" />
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75" />
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75" />
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120" />
+        <point x="165" y="165" />
+        <point x="180" y="210" />
+        <point x="180" y="240" />
+        <point x="150" y="300" />
+        <point x="165" y="300" />
+        <point x="195" y="240" />
+        <point x="195" y="195" />
+        <point x="165" y="135" />
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true" />
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true" />
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233" />
+        <point x="219" y="188" />
+        <point x="249" y="173" />
+        <point x="279" y="188" />
+        <point x="234" y="218" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255" />
+        <point x="150" y="210" />
+        <point x="105" y="210" />
+        <point x="75" y="240" />
+        <point x="135" y="240" />
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true" />
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120" />
+        <point x="150" y="15" />
+        <point x="285" y="120" />
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30" />
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210" />
+        <point x="135" y="195" />
+        <point x="120" y="210" />
+        <point x="60" y="210" />
+        <point x="30" y="195" />
+        <point x="60" y="180" />
+        <point x="60" y="165" />
+        <point x="15" y="135" />
+        <point x="30" y="120" />
+        <point x="15" y="105" />
+        <point x="40" y="104" />
+        <point x="45" y="90" />
+        <point x="60" y="90" />
+        <point x="90" y="105" />
+        <point x="105" y="120" />
+        <point x="120" y="120" />
+        <point x="105" y="60" />
+        <point x="120" y="60" />
+        <point x="135" y="30" />
+        <point x="150" y="15" />
+        <point x="165" y="30" />
+        <point x="180" y="60" />
+        <point x="195" y="60" />
+        <point x="180" y="120" />
+        <point x="195" y="120" />
+        <point x="210" y="105" />
+        <point x="240" y="90" />
+        <point x="255" y="90" />
+        <point x="263" y="104" />
+        <point x="285" y="105" />
+        <point x="270" y="120" />
+        <point x="285" y="135" />
+        <point x="240" y="165" />
+        <point x="240" y="180" />
+        <point x="270" y="195" />
+        <point x="240" y="210" />
+        <point x="180" y="210" />
+        <point x="165" y="195" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195" />
+        <point x="135" y="240" />
+        <point x="120" y="255" />
+        <point x="105" y="255" />
+        <point x="105" y="285" />
+        <point x="135" y="285" />
+        <point x="165" y="240" />
+        <point x="165" y="195" />
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150" />
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150" />
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15" />
+        <point x="15" y="120" />
+        <point x="60" y="285" />
+        <point x="240" y="285" />
+        <point x="285" y="120" />
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90" />
+        <point x="120" y="195" />
+        <point x="90" y="285" />
+        <point x="105" y="300" />
+        <point x="135" y="300" />
+        <point x="150" y="225" />
+        <point x="165" y="300" />
+        <point x="195" y="300" />
+        <point x="210" y="285" />
+        <point x="180" y="195" />
+        <point x="195" y="90" />
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90" />
+        <point x="240" y="150" />
+        <point x="225" y="180" />
+        <point x="165" y="105" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90" />
+        <point x="60" y="150" />
+        <point x="75" y="180" />
+        <point x="135" y="105" />
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255" />
+        <point x="90" y="210" />
+        <point x="45" y="195" />
+        <point x="75" y="255" />
+        <point x="135" y="285" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255" />
+        <point x="210" y="210" />
+        <point x="255" y="195" />
+        <point x="225" y="255" />
+        <point x="165" y="285" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180" />
+        <point x="90" y="135" />
+        <point x="45" y="120" />
+        <point x="75" y="180" />
+        <point x="135" y="210" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180" />
+        <point x="165" y="210" />
+        <point x="225" y="180" />
+        <point x="255" y="120" />
+        <point x="210" y="135" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105" />
+        <point x="90" y="60" />
+        <point x="45" y="45" />
+        <point x="75" y="105" />
+        <point x="135" y="135" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105" />
+        <point x="165" y="135" />
+        <point x="225" y="105" />
+        <point x="255" y="45" />
+        <point x="210" y="60" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90" />
+        <point x="120" y="45" />
+        <point x="150" y="15" />
+        <point x="180" y="45" />
+        <point x="165" y="90" />
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true" />
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true" />
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120" />
+        <point x="240" y="165" />
+        <point x="255" y="165" />
+        <point x="278" y="120" />
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true" />
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true" />
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285" />
+        <point x="30" y="285" />
+        <point x="30" y="240" />
+        <point x="15" y="195" />
+        <point x="45" y="210" />
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true" />
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true" />
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285" />
+        <point x="210" y="285" />
+        <point x="210" y="240" />
+        <point x="240" y="210" />
+        <point x="195" y="210" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85" />
+        <point x="285" y="105" />
+        <point x="302" y="99" />
+        <point x="294" y="83" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85" />
+        <point x="210" y="105" />
+        <point x="193" y="99" />
+        <point x="201" y="83" />
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true" />
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true" />
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true" />
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1" />
+        <point x="185" y="108" />
+        <point x="298" y="108" />
+        <point x="207" y="175" />
+        <point x="242" y="282" />
+        <point x="151" y="216" />
+        <point x="59" y="282" />
+        <point x="94" y="175" />
+        <point x="3" y="108" />
+        <point x="116" y="108" />
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true" />
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true" />
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true" />
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true" />
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true" />
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true" />
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true" />
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true" />
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true" />
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true" />
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true" />
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30" />
+        <point x="15" y="255" />
+        <point x="285" y="255" />
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30" />
+        <point x="15" y="255" />
+        <point x="285" y="255" />
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99" />
+        <point x="225" y="223" />
+        <point x="75" y="224" />
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193" />
+        <point x="296" y="150" />
+        <point x="259" y="134" />
+        <point x="244" y="104" />
+        <point x="208" y="104" />
+        <point x="207" y="194" />
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true" />
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112" />
+        <point x="252" y="141" />
+        <point x="219" y="141" />
+        <point x="218" y="112" />
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true" />
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true" />
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true" />
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true" />
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false" />
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false" />
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false" />
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204" />
+        <point x="240" y="233" />
+        <point x="246" y="254" />
+        <point x="228" y="266" />
+        <point x="215" y="252" />
+        <point x="193" y="210" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90" />
+        <point x="225" y="75" />
+        <point x="245" y="75" />
+        <point x="260" y="89" />
+        <point x="269" y="108" />
+        <point x="261" y="124" />
+        <point x="240" y="105" />
+        <point x="225" y="105" />
+        <point x="210" y="105" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90" />
+        <point x="75" y="75" />
+        <point x="55" y="75" />
+        <point x="40" y="89" />
+        <point x="31" y="108" />
+        <point x="39" y="124" />
+        <point x="60" y="105" />
+        <point x="75" y="105" />
+        <point x="90" y="105" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85" />
+        <point x="134" y="64" />
+        <point x="107" y="51" />
+        <point x="108" y="17" />
+        <point x="150" y="2" />
+        <point x="192" y="18" />
+        <point x="192" y="52" />
+        <point x="169" y="65" />
+        <point x="172" y="87" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204" />
+        <point x="60" y="233" />
+        <point x="54" y="254" />
+        <point x="72" y="266" />
+        <point x="85" y="252" />
+        <point x="107" y="210" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75" />
+        <point x="179" y="75" />
+        <point x="209" y="101" />
+        <point x="224" y="135" />
+        <point x="220" y="225" />
+        <point x="175" y="261" />
+        <point x="128" y="261" />
+        <point x="81" y="224" />
+        <point x="74" y="135" />
+        <point x="88" y="99" />
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true" />
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true" />
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150" />
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15" />
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true" />
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216" />
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40" />
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40" />
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84" />
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133" />
+        <point x="245" y="131" />
+        <point x="245" y="133" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194" />
+        <point x="13" y="197" />
+        <point x="30" y="191" />
+        <point x="38" y="193" />
+        <point x="38" y="205" />
+        <point x="20" y="226" />
+        <point x="20" y="257" />
+        <point x="27" y="265" />
+        <point x="38" y="266" />
+        <point x="40" y="260" />
+        <point x="31" y="253" />
+        <point x="31" y="230" />
+        <point x="60" y="206" />
+        <point x="68" y="198" />
+        <point x="75" y="209" />
+        <point x="66" y="228" />
+        <point x="65" y="243" />
+        <point x="82" y="261" />
+        <point x="84" y="268" />
+        <point x="100" y="267" />
+        <point x="103" y="261" />
+        <point x="77" y="239" />
+        <point x="79" y="231" />
+        <point x="100" y="207" />
+        <point x="98" y="196" />
+        <point x="119" y="201" />
+        <point x="143" y="202" />
+        <point x="160" y="195" />
+        <point x="166" y="210" />
+        <point x="172" y="213" />
+        <point x="173" y="238" />
+        <point x="167" y="251" />
+        <point x="160" y="248" />
+        <point x="154" y="265" />
+        <point x="169" y="264" />
+        <point x="178" y="247" />
+        <point x="186" y="240" />
+        <point x="198" y="260" />
+        <point x="200" y="271" />
+        <point x="217" y="271" />
+        <point x="219" y="262" />
+        <point x="207" y="258" />
+        <point x="195" y="230" />
+        <point x="192" y="198" />
+        <point x="210" y="184" />
+        <point x="227" y="164" />
+        <point x="242" y="144" />
+        <point x="259" y="145" />
+        <point x="284" y="151" />
+        <point x="277" y="141" />
+        <point x="293" y="140" />
+        <point x="299" y="134" />
+        <point x="297" y="127" />
+        <point x="273" y="119" />
+        <point x="270" y="105" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195" />
+        <point x="14" y="180" />
+        <point x="36" y="166" />
+        <point x="40" y="153" />
+        <point x="53" y="140" />
+        <point x="82" y="131" />
+        <point x="134" y="133" />
+        <point x="159" y="126" />
+        <point x="188" y="115" />
+        <point x="227" y="108" />
+        <point x="236" y="102" />
+        <point x="238" y="98" />
+        <point x="268" y="86" />
+        <point x="269" y="92" />
+        <point x="281" y="87" />
+        <point x="269" y="103" />
+        <point x="269" y="113" />
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75" />
+        <point x="225" y="30" />
+        <point x="30" y="225" />
+        <point x="75" y="270" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75" />
+        <point x="75" y="30" />
+        <point x="270" y="225" />
+        <point x="225" y="270" />
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0" />
+          <dash value="1.0" />
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0" />
+          <dash value="0.0" />
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0" />
+          <dash value="1.0" />
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150" />
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150" />
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="degree_vs_lethality" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go-exp</go>
+      <exitCondition>not bank-alive? or ticks-since-shock &gt;= 400</exitCondition>
+      <metrics>
+        <metric>bank-alive?</metric>
+        <metric>ticks-since-shock</metric>
+        <metric>peak-withdrawn</metric>
+        <metric>frac-withdrawn</metric>
+        <metric>frac-concerned</metric>
+        <metric>liquidity-ratio</metric>
+        <metric>count links / count turtles</metric>
+      </metrics>
+      <constants>
+        <steppedValueSet variable="avg-connections" first="2" step="1" last="20" />
+        <enumeratedValueSet variable="reserve-ratio">
+          <value value="0.02" /><value value="0.04" /><value value="0.06" /></enumeratedValueSet>
+        <enumeratedValueSet variable="fundamental-shock?">
+          <value value="false" />
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lolr-active?">
+          <value value="true" />
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-nodes">
+          <value value="200" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="beta">
+          <value value="0.1" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="watcher-share">
+          <value value="0.05" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="watcher-credibility">
+          <value value="0.9" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="risk-threshold">
+          <value value="0.2" /></enumeratedValueSet>
+        <enumeratedValueSet variable="shock-size">
+          <value value="0.6" /></enumeratedValueSet>
+        <enumeratedValueSet variable="spontaneous-concern">
+          <value value="0.005" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lolr-cap">
+          <value value="0.01" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="forgetfulness">
+          <value value="0.02" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="warmup-ticks">
+          <value value="25" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dynamic-rewiring?">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="weight-by-credibility-sum?">
+          <value value="false" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="event_study" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup</setup>
+      <go>go-event</go>
+      <exitCondition>ticks-since-shock &gt;= 200</exitCondition>
+      <metrics>
+        <metric>ticks-since-shock</metric>
+        <metric>liquidity-ratio</metric>
+        <metric>frac-withdrawn</metric>
+        <metric>frac-concerned</metric>
+        <metric>bank-alive?</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="avg-connections">
+          <value value="2" />
+          <value value="6" />
+          <value value="20" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reserve-ratio">
+          <value value="0.04" /></enumeratedValueSet>
+        <enumeratedValueSet variable="fundamental-shock?">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lolr-active?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-nodes">
+          <value value="200" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="beta">
+          <value value="0.1" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="watcher-share">
+          <value value="0.05" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="watcher-credibility">
+          <value value="0.9" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="risk-threshold">
+          <value value="0.2" /></enumeratedValueSet>
+        <enumeratedValueSet variable="shock-size">
+          <value value="0.6" /></enumeratedValueSet>
+        <enumeratedValueSet variable="spontaneous-concern">
+          <value value="0.005" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lolr-cap">
+          <value value="0.01" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="forgetfulness">
+          <value value="0.02" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="warmup-ticks">
+          <value value="25" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dynamic-rewiring?">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="weight-by-credibility-sum?">
+          <value value="false" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="pilot_smoketest" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go-exp</go>
+      <exitCondition>not bank-alive? or ticks-since-shock &gt;= 400</exitCondition>
+      <metrics>
+        <metric>bank-alive?</metric>
+        <metric>ticks-since-shock</metric>
+        <metric>peak-withdrawn</metric>
+        <metric>frac-withdrawn</metric>
+        <metric>frac-concerned</metric>
+        <metric>liquidity-ratio</metric>
+        <metric>count links / count turtles</metric>
+      </metrics>
+      <constants>
+        <steppedValueSet variable="avg-connections" first="2" step="4" last="18" />
+        <enumeratedValueSet variable="lolr-active?">
+          <value value="true" />
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="reserve-ratio">
+          <value value="0.04" /></enumeratedValueSet>
+        <enumeratedValueSet variable="fundamental-shock?">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-nodes">
+          <value value="200" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="beta">
+          <value value="0.1" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="watcher-share">
+          <value value="0.05" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="watcher-credibility">
+          <value value="0.9" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="risk-threshold">
+          <value value="0.2" /></enumeratedValueSet>
+        <enumeratedValueSet variable="shock-size">
+          <value value="0.6" /></enumeratedValueSet>
+        <enumeratedValueSet variable="spontaneous-concern">
+          <value value="0.005" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lolr-cap">
+          <value value="0.01" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="forgetfulness">
+          <value value="0.02" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="warmup-ticks">
+          <value value="25" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="dynamic-rewiring?">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="weight-by-credibility-sum?">
+          <value value="false" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
