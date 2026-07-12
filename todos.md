@@ -1,0 +1,1 @@
+- [ ] percieved signal ist entweder ein gewichteter Mittewert (if false) oder $\frac{\sum signal_i * credibility_i}{credibility_i}$ 
