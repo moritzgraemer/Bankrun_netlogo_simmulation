@@ -1,1 +1,3 @@
-- [ ] percieved signal ist entweder ein gewichteter Mittewert (if false) oder $\frac{\sum signal_i * credibility_i}{credibility_i}$ 
+- [ ] percieved signal ist entweder ein gewichteter Mittewert (if false) oder $\frac{\sum signal_i * credibility_i}{credibility_i}$
+- [ ] bank borrows liquidity if liquidity < $\underbrace{reserve_ratio * deposits}_{target}$ (this builds up dept. the bank pays this back if liquidity > target: as reporter visualize
+- [ ] 
